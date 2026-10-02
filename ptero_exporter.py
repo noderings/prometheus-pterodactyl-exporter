@@ -5,11 +5,101 @@ from __future__ import annotations
 import json
 import os
 import ssl
+import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
+from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 ACCEPT = "Application/vnd.pterodactyl.v1+json"
+# Live Wings usage for this many NodeRings servers per scrape. The rest keep their last sample.
+_USAGE_BATCH = 40
+_INDEX_INTERVAL = 300
+_RENDER_INTERVAL = 45
+_index_lock = threading.Lock()
+_index: dict[str, Any] = {"at": 0.0, "nr": [], "by_node": {}, "cursor": 0, "usage": {}}
+_render_lock = threading.Lock()
+_rendered = {"body": ""}
+
+
+def _read_page(base: str, key: str, path: str, per_page: int, page: int) -> tuple[list[dict[str, Any]], int]:
+    """One list page. A 400/500 page is split so one bad server does not drop the rest."""
+    join = "&" if "?" in path else "?"
+    try:
+        payload = _get(base, key, f"{path}{join}per_page={per_page}&page={page}")
+    except HTTPError as exc:
+        if exc.code not in {400, 500} or per_page <= 1:
+            if exc.code in {400, 500} and per_page <= 1:
+                print(f"skipping {path} page {page}: {exc.code}", flush=True)
+                return [], 0
+            raise
+        factor = 10 if per_page >= 10 else per_page
+        smaller = max(per_page // factor, 1)
+        start = (page - 1) * factor + 1
+        rows: list[dict[str, Any]] = []
+        for sub in range(start, start + factor):
+            part, _total = _read_page(base, key, path, smaller, sub)
+            rows.extend(part)
+        return rows, 0
+    rows = []
+    for item in payload.get("data") or []:
+        attrs = item.get("attributes") or {}
+        if isinstance(attrs, dict):
+            rows.append(attrs)
+    total_pages = int(((payload.get("meta") or {}).get("pagination") or {}).get("total_pages") or 1)
+    return rows, total_pages
+
+
+def _nr_name(server: dict[str, Any]) -> str:
+    """NR external id for a NodeRings server. Empty unless external_id is NR-*."""
+    external_id = str(server.get("external_id") or "").strip()
+    if external_id.upper().startswith("NR-"):
+        return external_id
+    return ""
+
+
+def _index_servers(base: str, key: str) -> None:
+    """All servers, for node totals. Per-server series are only external ids that start with NR-.
+
+    A page that returns 400/500 is split so one bad server does not drop the index.
+    """
+    nr: list[dict[str, Any]] = []
+    by_node: dict[int, dict[str, Any]] = {}
+    page = 1
+    total_pages = 1
+    while page <= total_pages:
+        part, reported = _read_page(base, key, "/api/application/servers", 100, page)
+        for row in part:
+            node_id = int(row.get("node") or 0)
+            slot = by_node.setdefault(node_id, {"servers": 0, "cpu": 0.0})
+            slot["servers"] += 1
+            slot["cpu"] += int((row.get("limits") or {}).get("cpu") or 0) / 100.0
+            if _nr_name(row):
+                nr.append(row)
+        if reported:
+            total_pages = reported
+        page += 1
+    with _index_lock:
+        _index["at"] = time.monotonic()
+        _index["nr"] = nr
+        _index["by_node"] = by_node
+    panel_servers = sum(int(slot["servers"]) for slot in by_node.values())
+    print(f"server index ready: {len(nr)} noderings, {panel_servers} on the panel", flush=True)
+
+
+def _refresh_index(base: str, key: str) -> None:
+    while True:
+        try:
+            _index_servers(base, key)
+        except Exception as exc:  # noqa: BLE001
+            print(f"server index failed: {exc}", flush=True)
+        time.sleep(_INDEX_INTERVAL)
+
+
+def _indexed_servers() -> tuple[list[dict[str, Any]], dict[int, dict[str, Any]], bool]:
+    with _index_lock:
+        return list(_index["nr"]), dict(_index["by_node"]), float(_index["at"]) > 0
 
 
 def _get(base: str, key: str, path: str) -> dict[str, Any]:
@@ -17,8 +107,17 @@ def _get(base: str, key: str, path: str) -> dict[str, Any]:
         base.rstrip("/") + path,
         headers={"Authorization": f"Bearer {key}", "Accept": ACCEPT},
     )
-    with urlopen(request, timeout=20) as response:
-        return json.load(response)
+    delay = 2.0
+    for attempt in range(4):
+        try:
+            with urlopen(request, timeout=20) as response:
+                return json.load(response)
+        except HTTPError as exc:
+            if exc.code != 429 or attempt == 3:
+                raise
+            time.sleep(delay)
+            delay *= 2
+    raise RuntimeError("unreachable")
 
 
 def collect(base: str, application_key: str, client_key: str = "") -> str:
@@ -31,8 +130,6 @@ def collect(base: str, application_key: str, client_key: str = "") -> str:
         "# TYPE ptero_node_disk_bytes gauge",
         "# HELP ptero_node_disk_allocated_bytes Disk assigned to servers on the node.",
         "# TYPE ptero_node_disk_allocated_bytes gauge",
-        "# HELP ptero_node_allocations_free Unassigned allocations.",
-        "# TYPE ptero_node_allocations_free gauge",
         "# HELP ptero_node_servers Servers on the node.",
         "# TYPE ptero_node_servers gauge",
         "# HELP ptero_node_memory_overallocate Extra memory percent above the node limit. 0 means sell up to the limit.",
@@ -62,8 +159,8 @@ def collect(base: str, application_key: str, client_key: str = "") -> str:
         "# HELP ptero_server_network_tx_bytes Bytes sent.",
         "# TYPE ptero_server_network_tx_bytes counter",
     ]
-    servers_payload = _get(base, application_key, "/api/application/servers?per_page=100")
-    server_rows = [item.get("attributes") or {} for item in servers_payload.get("data") or []]
+    nr_servers, by_node, indexed = _indexed_servers()
+    usage = _usage_for_scrape(base, client_key, nr_servers)
     nodes = _get(base, application_key, "/api/application/nodes?per_page=100")
     for item in nodes.get("data") or []:
         node = item["attributes"]
@@ -76,10 +173,10 @@ def collect(base: str, application_key: str, client_key: str = "") -> str:
         disk_used = int(allocated.get("disk") or 0) * 1024 * 1024
         memory_over = int(node.get("memory_overallocate") or 0)
         disk_over = int(node.get("disk_overallocate") or 0)
-        free = _free_allocations(base, application_key, node_id)
-        servers = int(allocated.get("servers") or 0) if "servers" in allocated else _server_count_rows(server_rows, node_id)
+        stats = by_node.get(node_id) if indexed else None
+        if stats is None and indexed:
+            stats = {"servers": 0, "cpu": 0.0}
         cpu_cores = _cpu_cores(base, application_key, node)
-        cpu_allocated = _cpu_allocated(server_rows, node_id)
         maintenance = 1 if node.get("maintenance_mode") else 0
         labels = f'node="{name}",node_id="{node_id}"'
         lines.append(f"ptero_node_memory_bytes{{{labels}}} {memory}")
@@ -89,46 +186,55 @@ def collect(base: str, application_key: str, client_key: str = "") -> str:
         lines.append(f"ptero_node_memory_overallocate{{{labels}}} {memory_over}")
         lines.append(f"ptero_node_disk_overallocate{{{labels}}} {disk_over}")
         lines.append(f"ptero_node_cpu_cores{{{labels}}} {cpu_cores}")
-        lines.append(f"ptero_node_cpu_allocated{{{labels}}} {cpu_allocated}")
-        lines.append(f"ptero_node_allocations_free{{{labels}}} {free}")
-        lines.append(f"ptero_node_servers{{{labels}}} {servers}")
+        if stats is not None:
+            lines.append(f"ptero_node_cpu_allocated{{{labels}}} {stats['cpu']}")
+        if stats is not None:
+            lines.append(f"ptero_node_servers{{{labels}}} {stats['servers']}")
         lines.append(f"ptero_node_maintenance{{{labels}}} {maintenance}")
-    for server in server_rows:
-        label = f'name="{_label(server.get("name") or "")}",identifier="{_label(server.get("identifier") or "")}"'
+    for server in nr_servers:
+        nr_name = _nr_name(server)
+        label = f'name="{_label(nr_name)}",identifier="{_label(server.get("identifier") or "")}"'
         installed = 0 if server.get("status") in {"installing", "install_failed"} else 1
         lines.append(f"ptero_server_up{{{label}}} {installed}")
-        lines.extend(_server_usage_lines(base, client_key, server))
+        lines.extend(usage.get(nr_name) or _limit_lines(server))
     lines.append("")
     return "\n".join(lines)
 
 
-def _free_allocations(base: str, key: str, node_id: int) -> int:
-    page = 1
-    free = 0
-    while True:
-        payload = _get(base, key, f"/api/application/nodes/{node_id}/allocations?per_page=100&page={page}")
-        for item in payload.get("data") or []:
-            if not item["attributes"].get("assigned"):
-                free += 1
-        total_pages = int(((payload.get("meta") or {}).get("pagination") or {}).get("total_pages") or 1)
-        if page >= total_pages:
-            return free
-        page += 1
+def _limit_lines(server: dict[str, Any]) -> list[str]:
+    nr_name = _nr_name(server)
+    identifier = str(server.get("identifier") or "").strip()
+    if not nr_name or not identifier:
+        return []
+    limits = server.get("limits") or {}
+    mib = 1024 * 1024
+    labels = f'name="{_label(nr_name)}",identifier="{_label(identifier)}"'
+    return [
+        f"ptero_server_memory_limit_bytes{{{labels}}} {int(limits.get('memory') or 0) * mib}",
+        f"ptero_server_disk_limit_bytes{{{labels}}} {int(limits.get('disk') or 0) * mib}",
+    ]
 
 
-def _server_count_rows(rows: list[dict[str, Any]], node_id: int) -> int:
-    return sum(1 for row in rows if int(row.get("node") or 0) == node_id)
-
-
-def _cpu_allocated(rows: list[dict[str, Any]], node_id: int) -> float:
-    """Pterodactyl cpu limit 100 is one core."""
-    total = 0.0
-    for row in rows:
-        if int(row.get("node") or 0) != node_id:
-            continue
-        limits = row.get("limits") or {}
-        total += int(limits.get("cpu") or 0) / 100.0
-    return total
+def _usage_for_scrape(base: str, client_key: str, servers: list[dict[str, Any]]) -> dict[str, list[str]]:
+    """Refresh live usage for a slice of NodeRings servers. Earlier slices keep their last sample."""
+    with _index_lock:
+        cached = {key: list(lines) for key, lines in _index["usage"].items()}
+        cursor = int(_index["cursor"])
+    if not servers or not client_key:
+        return cached
+    count = min(_USAGE_BATCH, len(servers))
+    fresh: dict[str, list[str]] = {}
+    for offset in range(count):
+        server = servers[(cursor + offset) % len(servers)]
+        nr_name = _nr_name(server)
+        lines = _server_usage_lines(base, client_key, server)
+        if nr_name and lines:
+            fresh[nr_name] = lines
+    with _index_lock:
+        _index["cursor"] = (cursor + count) % len(servers)
+        _index["usage"].update(fresh)
+        cached.update(fresh)
+    return cached
 
 
 def _cpu_cores(base: str, key: str, node: dict[str, Any]) -> int:
@@ -171,10 +277,10 @@ def _cpu_cores(base: str, key: str, node: dict[str, Any]) -> int:
 
 
 def _server_usage_lines(base: str, client_key: str, server: dict[str, Any]) -> list[str]:
-    """Live usage for a NodeRings server. Name label is NR-{external id}, same as a VM."""
-    external_id = str(server.get("external_id") or "").strip()
+    """Live usage for a server whose panel name is NR-*."""
+    nr_name = _nr_name(server)
     identifier = str(server.get("identifier") or "").strip()
-    if not external_id or not identifier or not client_key:
+    if not nr_name or not identifier or not client_key:
         return []
     try:
         payload = _get(base, client_key, f"/api/client/servers/{identifier}/resources")
@@ -187,7 +293,7 @@ def _server_usage_lines(base: str, client_key: str, server: dict[str, Any]) -> l
     cpu_absolute = float(resources.get("cpu_absolute") or 0)
     cpu_limit = float(limits.get("cpu") or 0)
     cpu_percent = (cpu_absolute / cpu_limit * 100) if cpu_limit > 0 else cpu_absolute
-    labels = f'name="NR-{_label(external_id)}",identifier="{_label(identifier)}"'
+    labels = f'name="{_label(nr_name)}",identifier="{_label(identifier)}"'
     return [
         f"ptero_server_cpu_percent{{{labels}}} {cpu_percent}",
         f"ptero_server_memory_bytes{{{labels}}} {int(resources.get('memory_bytes') or 0)}",
@@ -232,6 +338,31 @@ def _stamp_panel(line: str, panel: str) -> str:
     return f"{metric} {rest}"
 
 
+def _refresh_render(base: str, application_key: str, client_key: str) -> None:
+    """Rebuild the metrics text off the scrape path. A panel walk takes longer than the scrape timeout."""
+    while True:
+        try:
+            body = render(base, application_key, client_key)
+            with _render_lock:
+                _rendered["body"] = body
+            print("metrics refresh ready", flush=True)
+        except Exception as exc:  # noqa: BLE001
+            print(f"metrics refresh failed: {exc}", flush=True)
+        time.sleep(_RENDER_INTERVAL)
+
+
+def _cached_body(panel: str) -> str:
+    with _render_lock:
+        body = _rendered["body"]
+    if body:
+        return body
+    return (
+        "# HELP ptero_up Panel API scrape succeeded.\n"
+        "# TYPE ptero_up gauge\n"
+        f'ptero_up{{panel="{panel}"}} 0\n'
+    )
+
+
 def render(base: str, application_key: str, client_key: str = "") -> str:
     """Prometheus text. ptero_up is 0 when the panel API cannot be read."""
     panel = _label(panel_instance(base))
@@ -257,7 +388,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(404)
             self.end_headers()
             return
-        body = render(self.base, self.key, self.client_key).encode()
+        body = _cached_body(panel_instance(self.base)).encode()
         self.send_response(200)
         self.send_header("Content-Type", "text/plain; version=0.0.4")
         self.send_header("Content-Length", str(len(body)))
@@ -272,6 +403,18 @@ def main() -> None:
     Handler.base = os.environ["PTERODACTYL_PANEL_URL"]
     Handler.key = os.environ["PTERODACTYL_APPLICATION_KEY"]
     Handler.client_key = os.environ.get("PTERODACTYL_CLIENT_KEY", "")
+    threading.Thread(
+        target=_refresh_index,
+        args=(Handler.base, Handler.key),
+        name="server-index",
+        daemon=True,
+    ).start()
+    threading.Thread(
+        target=_refresh_render,
+        args=(Handler.base, Handler.key, Handler.client_key),
+        name="metrics-refresh",
+        daemon=True,
+    ).start()
     port = int(os.environ.get("PTERODACTYL_EXPORTER_PORT", "9222"))
     host = os.environ.get("PTERODACTYL_EXPORTER_ADDR", "0.0.0.0")
     ThreadingHTTPServer((host, port), Handler).serve_forever()
